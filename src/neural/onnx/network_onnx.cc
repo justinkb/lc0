@@ -38,7 +38,10 @@
 #define USE_DML
 #endif
 
+#if __has_include("cpu_provider_factory.h")
 #include "cpu_provider_factory.h"
+#define USE_CPU
+#endif
 #include "neural/factory.h"
 #include "neural/loader.h"
 #include "neural/network.h"
@@ -52,7 +55,7 @@
 namespace lczero {
 namespace {
 
-enum class OnnxProvider { CPU, CUDA, DML };
+enum class OnnxProvider { CPU, CUDA, DML, ROCM };
 
 class OnnxNetwork;
 
@@ -241,12 +244,12 @@ void OnnxComputation<DataType>::ComputeBlocking() {
     int batch = batch_size * step;
 
     auto input_tensor = PrepareInputs(i, batch);
-    if (network_->provider_ == OnnxProvider::DML) network_->lock_.lock();
+    if (network_->provider_ == OnnxProvider::DML || network_->provider_ == OnnxProvider::ROCM) network_->lock_.lock();
     network_->session_[step - 1].Run(
         {}, network_->inputs_cstr_.data(), &input_tensor, 1,
         network_->outputs_cstr_.data(), output_tensors_.data(),
         output_tensors_.size());
-    if (network_->provider_ == OnnxProvider::DML) network_->lock_.unlock();
+    if (network_->provider_ == OnnxProvider::DML || network_->provider_ == OnnxProvider::ROCM) network_->lock_.unlock();
     i += batch;
   }
 }
@@ -281,6 +284,8 @@ Ort::SessionOptions GetOptions(OnnxProvider provider, int gpu, int batch_size) {
       options.AppendExecutionProvider_CUDA(cuda_options);
       break;
     case OnnxProvider::CPU:
+    {
+#ifdef USE_CPU
       // Doesn't really work. :-( There are two execution providers (CUDA and
       // CPU) already added, don't know how to force it to use CPU.
       auto status = OrtSessionOptionsAppendExecutionProvider_CPU(options, 0);
@@ -291,6 +296,14 @@ Ort::SessionOptions GetOptions(OnnxProvider provider, int gpu, int batch_size) {
         throw Exception("ONNX CPU error " + std::to_string(error_code) + ": " +
                         error_message);
       }
+#else
+      throw Exception("ONNX backend internal error.");
+#endif
+    }
+      break;
+    case OnnxProvider::ROCM:
+      Ort::ThrowOnError(
+          OrtSessionOptionsAppendExecutionProvider_ROCM(options, gpu));
       break;
   }
   return options;
@@ -364,7 +377,7 @@ std::unique_ptr<Network> MakeOnnxNetwork(const std::optional<WeightsFile>& w,
   if (batch_size <= 0) batch_size = -1;  // Variable batch size.
 
   bool fp16 = opts.GetOrDefault<bool>(
-      "fp16", kProvider == OnnxProvider::CPU ? false : true);
+      "fp16", (kProvider == OnnxProvider::CPU || kProvider == OnnxProvider::ROCM) ? false : true);
 
   if (w->has_onnx_model()) {
     return std::make_unique<OnnxNetwork>(*w, opts, kProvider, gpu, false,
@@ -423,7 +436,10 @@ std::unique_ptr<Network> MakeOnnxNetwork(const std::optional<WeightsFile>& w,
 REGISTER_NETWORK("onnx-dml", MakeOnnxNetwork<OnnxProvider::DML>, 63)
 #endif
 REGISTER_NETWORK("onnx-cuda", MakeOnnxNetwork<OnnxProvider::CUDA>, 61)
+#ifdef USE_CPU
 REGISTER_NETWORK("onnx-cpu", MakeOnnxNetwork<OnnxProvider::CPU>, 62)
+#endif
+REGISTER_NETWORK("onnx-rocm", MakeOnnxNetwork<OnnxProvider::ROCM>, 61)
 
 }  // namespace
 }  // namespace lczero
